@@ -15,16 +15,19 @@ const (
 	MemTableSizeThreshold = 1 * 1024 * 4 //4KB
 	stateFileName         = "state.json"
 	activeWalFileName     = "db.wal"
+	SSTableCountThreshold = 3
 )
 
 type DBState struct {
-	SSTableCounter int `json:"sstable_counter"`
+	NextFileNumber int   `json:"next_file_number"`
+	ActiveSSTables []int `json:"active_sstables"`
 }
 
 // saveState serializes the current DB state to a json file
 func (db *DB) saveState() error {
 	state := DBState{
-		SSTableCounter: db.ssTableCounter,
+		NextFileNumber: db.nextFileNumber,
+		ActiveSSTables: db.activeSSTables,
 	}
 	data, err := json.MarshalIndent(state, "", "\t")
 	if err != nil {
@@ -41,7 +44,8 @@ type DB struct {
 	immutableMem *MemTable //hold the memtable data being flushed
 
 	dataDir        string
-	ssTableCounter int
+	nextFileNumber int
+	activeSSTables []int
 	//global sequence number for all operations
 	sequenceNum atomic.Uint64
 }
@@ -61,7 +65,8 @@ func NewDB(dir string) (*DB, error) {
 		if os.IsNotExist(err) {
 			log.Println("State file not found, initializing with default state...")
 			state = DBState{
-				SSTableCounter: 1,
+				NextFileNumber: 1,
+				ActiveSSTables: []int{},
 			}
 		} else {
 			return nil, err
@@ -70,7 +75,7 @@ func NewDB(dir string) (*DB, error) {
 		if err := json.Unmarshal(data, &state); err != nil {
 			return nil, err
 		}
-		log.Printf("Loaded state: SSTableCounter is %d", state.SSTableCounter)
+		log.Printf("Loaded state: NextFileNumber is %d, ActiveSSTables: %v", state.NextFileNumber, state.ActiveSSTables)
 	}
 	mem := NewMemTable()
 	var maxSeqNum uint64 = 0
@@ -110,7 +115,8 @@ func NewDB(dir string) (*DB, error) {
 		wal:            wal,
 		mem:            mem,
 		dataDir:        dir,
-		ssTableCounter: state.SSTableCounter,
+		nextFileNumber: state.NextFileNumber,
+		activeSSTables: state.ActiveSSTables,
 	}
 	db.sequenceNum.Store(maxSeqNum)
 	err = db.saveState()
@@ -129,8 +135,10 @@ func (db *DB) flushMemtable() {
 		return
 	}
 	//WAL rotation
+	sstNum := db.nextFileNumber
+	db.nextFileNumber++
 	walPath := db.wal.file.Name()
-	rotatedWalPath := fmt.Sprintf("%s/wal-%05d.log", db.dataDir, db.ssTableCounter)
+	rotatedWalPath := fmt.Sprintf("%s/wal-%05d.log", db.dataDir, sstNum)
 	db.wal.Close()
 	if err := os.Rename(walPath, rotatedWalPath); err != nil {
 		log.Printf("CRITICAL: Failed to rename WAL: %v", err)
@@ -146,12 +154,14 @@ func (db *DB) flushMemtable() {
 	db.wal = newWal
 	db.immutableMem = db.mem
 	db.mem = NewMemTable()
+	if len(db.activeSSTables) >= SSTableCountThreshold {
+		go db.compact()
+	}
 	db.mu.Unlock()
 
-	go func(imm *MemTable, walToDelete string) {
-		log.Println("Background flush: Starting to write SSTable...")
-		sstablePath := fmt.Sprintf("%s/%05d.sst", db.dataDir, db.ssTableCounter)
-		db.ssTableCounter++
+	go func(imm *MemTable, walToDelete string, sstNum int) {
+		log.Printf("Background flush: Starting to write SSTable %s...", sstNum)
+		sstablePath := fmt.Sprintf("%s/%05d.sst", db.dataDir, sstNum)
 		itemCount := imm.data.Len()
 		if err := WriteSSTable(sstablePath, uint(itemCount), imm.data.Front()); err != nil {
 			log.Printf("ERROR: Failed to write SSTable: %v", err)
@@ -161,6 +171,8 @@ func (db *DB) flushMemtable() {
 		db.mu.Lock()
 		defer db.mu.Unlock()
 		db.immutableMem = nil
+		db.activeSSTables = append(db.activeSSTables, sstNum)
+		sort.Ints(db.activeSSTables)
 		if err := db.saveState(); err != nil {
 			log.Printf("CRITICAL ERROR: Failed to save state file: %v", err)
 			return
@@ -174,7 +186,7 @@ func (db *DB) flushMemtable() {
 		}
 
 		return
-	}(db.immutableMem, rotatedWalPath)
+	}(db.immutableMem, rotatedWalPath, sstNum)
 }
 func (db *DB) Put(key, value []byte) error {
 	seqNum := db.sequenceNum.Add(1)
@@ -209,7 +221,7 @@ func (db *DB) Get(key []byte) ([]byte, bool) {
 	db.mu.RLock()
 	mem := db.mem
 	imm := db.immutableMem
-	counter := db.ssTableCounter
+	activeTables := db.activeSSTables
 	db.mu.RUnlock()
 	//1.check in active memtable
 	val, found := mem.Get(key)
@@ -231,10 +243,11 @@ func (db *DB) Get(key []byte) ([]byte, bool) {
 			return val, true
 		}
 	}
-	log.Printf("sstable count: %d", counter)
+	log.Printf("sstable count: %d", len(activeTables))
 	//3.search key in newest to oldest SSTables
-	for i := db.ssTableCounter - 1; i > 0; i-- {
-		ssTablePath := fmt.Sprintf("%s/%05d.sst", db.dataDir, i)
+	for i := len(activeTables) - 1; i > 0; i-- {
+		sstNum := activeTables[i]
+		ssTablePath := fmt.Sprintf("%s/%05d.sst", db.dataDir, sstNum)
 		reader, err := NewSSTableReader(ssTablePath)
 		if err != nil {
 			log.Printf("Error opening SSTable reader for %s: %v", ssTablePath, err)

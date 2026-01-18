@@ -1,5 +1,7 @@
 package main
 
+import "github.com/huandu/skiplist"
+
 // OpType defines the operation type for a log entry
 type OpType = byte
 
@@ -41,4 +43,7 @@ func (c internalKeyComparable) Compare(k1, k2 interface{}) int {
 		return 1
 	}
 	return 0
+}
+func NewInternalKeyComparator() skiplist.Comparable {
+	return internalKeyComparable{}
 }
