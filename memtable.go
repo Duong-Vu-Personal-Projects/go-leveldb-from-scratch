@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"sync"
 
 	"github.com/huandu/skiplist"
@@ -24,28 +25,35 @@ type MemTable struct {
 
 func NewMemTable() *MemTable {
 	return &MemTable{
-		data: skiplist.New(skiplist.Bytes),
+		data: skiplist.New(internalKeyComparable{}),
 	}
 }
-func (m *MemTable) Put(key, value []byte) {
+func (m *MemTable) Put(key InternalKey, value []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	//if exists -> update
-	if oldElement := m.data.Get(key); oldElement != nil {
-		oldValue := oldElement.Value.([]byte)
-		m.size -= len(key) + len(oldValue)
-	}
 	m.data.Set(key, value)
-	m.size += len(key) + len(value)
+	m.size += len(key.UserKey) + len(value)
 }
 func (m *MemTable) Get(key []byte) ([]byte, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	element := m.data.Get(key)
-	if element != nil {
-		return element.Value.([]byte), true
+	searchKey := InternalKey{
+		UserKey: string(key),
+		SeqNum:  math.MaxUint64,
+		Type:    OpTypePut,
 	}
-	return nil, false
+	element := m.data.Find(searchKey)
+	if element == nil {
+		return nil, false //not found
+	}
+	foundKey := element.Key().(InternalKey)
+	if foundKey.UserKey != string(key) {
+		return nil, false //not a match
+	}
+	if foundKey.Type == OpTypeDelete {
+		return nil, true //delete operation, so don't have value
+	}
+	return element.Value.([]byte), true
 }
 
 // remove a key

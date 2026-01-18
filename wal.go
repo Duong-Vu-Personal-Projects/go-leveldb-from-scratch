@@ -17,9 +17,10 @@ const (
 
 // Log Entry represents single operation in the WAL
 type LogEntry struct {
-	Op    byte
-	Key   []byte
-	Value []byte
+	Op     byte
+	Key    []byte
+	Value  []byte
+	SeqNum uint64
 }
 
 type WAL struct {
@@ -58,7 +59,7 @@ func (w *WAL) Close() error {
 // [crc (4 bytes)] [length (2 bytes, little-endian)] [type (1 byte)] [payload (length bytes)]
 // i use slightly different format
 // [Checksum(4 bytes)][Header][KV]
-// Header =[Key Size (4 bytes)] [Value Size (4 bytes)] [Operation (1 byte)]
+// Header =[Seq(8 bytes)][Key Size (4 bytes)] [Value Size (4 bytes)] [Operation (1 byte)]
 // KV = [Key][Value]
 func (w *WAL) Write(entry *LogEntry) error {
 	w.mu.Lock()
@@ -66,16 +67,17 @@ func (w *WAL) Write(entry *LogEntry) error {
 	keySize := len(entry.Key)
 	valueSize := len(entry.Value)
 
-	//Total size: key_size(4) + value_size(4) + op(1) + key + value
-	entrySize := 4 + 4 + 1 + keySize + valueSize
+	//Total size: seq(8 byte) + key_size(4) + value_size(4) + op(1) + key + value
+	entrySize := 8 + 4 + 4 + 1 + keySize + valueSize
 	buf := make([]byte, entrySize)
 
 	//encode the entry fields into the buffer
-	binary.LittleEndian.PutUint32(buf[0:4], uint32(keySize))
-	binary.LittleEndian.PutUint32(buf[4:8], uint32(valueSize))
-	buf[8] = entry.Op
-	copy(buf[9:9+keySize], entry.Key)
-	copy(buf[9+keySize:], entry.Value)
+	binary.LittleEndian.PutUint64(buf[0:8], entry.SeqNum)
+	binary.LittleEndian.PutUint32(buf[8:12], uint32(keySize))
+	binary.LittleEndian.PutUint32(buf[12:16], uint32(valueSize))
+	buf[16] = entry.Op
+	copy(buf[17:17+keySize], entry.Key)
+	copy(buf[17+keySize:], entry.Value)
 	//Calculate checksum over the encoded data
 	checkSum := crc32.ChecksumIEEE(buf)
 
@@ -96,23 +98,29 @@ func (w *WAL) Write(entry *LogEntry) error {
 	return w.file.Sync()
 }
 
+type RecoveredValue struct {
+	Value []byte
+	Type  OpType
+}
+
 // Replay read all entries from the WAL file at the given path and reconstruct
 // the in-memory state by replaying the operations
-func Replay(path string) (map[string][]byte, error) {
+func Replay(path string) (map[InternalKey]RecoveredValue, uint64, error) {
 	//open the file for reading only
 	flag := os.O_RDONLY
 	mode := os.FileMode(0644)
 	file, err := os.OpenFile(path, flag, mode)
 	if err != nil {
-		//if the file doesn't exist, meaning no data to recover, which is not an error
+		//if the file doesn't exist, meaning no data to recover
 		if os.IsNotExist(err) {
-			return make(map[string][]byte), nil
+			return make(map[InternalKey]RecoveredValue), 0, nil
 		}
-		return nil, err
+		return nil, 0, err
 
 	}
 	defer file.Close()
-	data := make(map[string][]byte)
+	data := make(map[InternalKey]RecoveredValue)
+	var maxSeqNum uint64 = 0
 	reader := bufio.NewReader(file)
 
 	for {
@@ -123,41 +131,42 @@ func Replay(path string) (map[string][]byte, error) {
 			if err == io.EOF {
 				break
 			}
-			return nil, err
+			return nil, 0, err
 		}
-		//2.read sizes
-		var keySize, valueSize uint32
-		if err := binary.Read(reader, binary.LittleEndian, &keySize); err != nil {
-			return nil, err
-		}
-		if err := binary.Read(reader, binary.LittleEndian, &valueSize); err != nil {
-			return nil, err
-		}
-		//3.read the rest of the data (op + key+value)
-		entryDataSize := 1 + int(keySize) + int(valueSize)
-		entryData := make([]byte, entryDataSize)
-		if _, err := io.ReadFull(reader, entryData); err != nil {
-			return nil, err
-		}
-		//4.combine headers and data to verify checksum
-		headerData := make([]byte, 8) //4 for keySize, 4 for valueSize
-		binary.LittleEndian.PutUint32(headerData[0:4], keySize)
-		binary.LittleEndian.PutUint32(headerData[4:8], valueSize)
-		fullData := append(headerData, entryData...)
 
-		actualChecksum := crc32.ChecksumIEEE(fullData)
-		if storedChecksum != actualChecksum {
-			return nil, fmt.Errorf("data corruption: checksum mismatch")
+		//2.read sizes
+		headerBuf := make([]byte, 8+4+4+1)
+		if _, err := io.ReadFull(reader, headerBuf); err != nil {
+			return nil, 0, fmt.Errorf("could not read header: %w", err)
 		}
-		//5. decode and apply the operation to map
-		op := entryData[0]
-		key := entryData[1 : 1+keySize]
-		value := entryData[1+keySize:]
-		if op == OpPut {
-			data[string(key)] = value
-		} else if op == OpDelete {
-			delete(data, string(key))
+		seqNum := binary.LittleEndian.Uint64(headerBuf[0:8])
+		keySize := binary.LittleEndian.Uint32(headerBuf[8:12])
+		valueSize := binary.LittleEndian.Uint32(headerBuf[12:16])
+		op := headerBuf[16]
+		kvBuf := make([]byte, keySize+valueSize)
+		if _, err := io.ReadFull(reader, kvBuf); err != nil {
+			return nil, 0, fmt.Errorf("could not read key/value: %v", err)
+		}
+
+		fullDataPayload := append(headerBuf, kvBuf...)
+		actualChecksum := crc32.ChecksumIEEE(fullDataPayload)
+		if storedChecksum != actualChecksum {
+			return nil, 0, fmt.Errorf("data corruption: checksum mismatch")
+		}
+		if seqNum > maxSeqNum {
+			maxSeqNum = seqNum
+		}
+		key := kvBuf[:keySize]
+		value := kvBuf[keySize:]
+		internalKey := InternalKey{
+			UserKey: string(key),
+			SeqNum:  seqNum,
+			Type:    op,
+		}
+		data[internalKey] = RecoveredValue{
+			Value: value,
+			Type:  op,
 		}
 	}
-	return data, nil
+	return data, maxSeqNum, nil
 }
