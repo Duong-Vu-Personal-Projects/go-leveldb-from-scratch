@@ -2,15 +2,35 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
 const (
 	MemTableSizeThreshold = 1 * 1024 * 4 //4KB
+	stateFileName         = "state.json"
 )
+
+type DBState struct {
+	SSTableCounter int `json:"sstable_counter"`
+}
+
+// saveState serializes the current DB state to a json file
+func (db *DB) saveState() error {
+	state := DBState{
+		SSTableCounter: db.ssTableCounter,
+	}
+	data, err := json.MarshalIndent(state, "", "\t")
+	if err != nil {
+		return err
+	}
+	statePath := filepath.Join(db.dataDir, stateFileName)
+	return os.WriteFile(statePath, data, 0644)
+}
 
 type DB struct {
 	mu  sync.RWMutex
@@ -26,6 +46,24 @@ func NewDB(dir string) (*DB, error) {
 	//file mode 0755: https://www.warp.dev/terminus/chmod-755
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
+	}
+	statePath := filepath.Join(dir, stateFileName)
+	var state DBState
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Println("State file not found, initializing with default state...")
+			state = DBState{
+				SSTableCounter: 1,
+			}
+		} else {
+			return nil, err
+		}
+	} else {
+		if err := json.Unmarshal(data, &state); err != nil {
+			return nil, err
+		}
+		log.Printf("Loaded state: SSTableCounter is %d", state.SSTableCounter)
 	}
 	walPath := fmt.Sprintf("%s/db.wal", dir)
 	recoveredData, err := Replay(walPath)
@@ -47,7 +85,7 @@ func NewDB(dir string) (*DB, error) {
 		wal:            wal,
 		mem:            mem,
 		dataDir:        dir,
-		ssTableCounter: 1,
+		ssTableCounter: state.SSTableCounter,
 	}, nil
 }
 func (db *DB) flushMemtable() error {
@@ -72,6 +110,10 @@ func (db *DB) flushMemtable() error {
 		return err
 	}
 	log.Printf("Successfully flushed memtable to %s", ssTablePath)
+	if err := db.saveState(); err != nil {
+		log.Printf("CRITICAL: Failed to save state file: %v", err)
+		return err
+	}
 	log.Println("Truncating WAL file...")
 	if err := db.wal.Close(); err != nil {
 		log.Printf("CRITICAL: Failed to close old WAL file: %v", err)
@@ -114,7 +156,26 @@ func (db *DB) Put(key, value []byte) error {
 
 }
 func (db *DB) Get(key []byte) ([]byte, bool) {
-	return db.mem.Get(key)
+	db.mu.RLock()
+	val, ok := db.mem.Get(key)
+	db.mu.RUnlock()
+	if ok {
+		return val, true
+	}
+	log.Printf("sstable count: %d", db.ssTableCounter)
+	//search key in newest to oldest SSTables
+	for i := db.ssTableCounter - 1; i > 0; i-- {
+		ssTablePath := fmt.Sprintf("%s/%05d.sst", db.dataDir, i)
+		val, found, err := FindInSSTable(ssTablePath, key)
+		if err != nil {
+			log.Printf("Error reading SSTable %s: %v", ssTablePath, err)
+			continue
+		}
+		if found {
+			return val, true
+		}
+	}
+	return nil, false
 }
 func (db *DB) Delete(key []byte) error {
 	entry := LogEntry{
