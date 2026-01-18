@@ -195,9 +195,13 @@ func (db *DB) compact() {
 		return
 	}
 	log.Println("Compaction completed successfully.")
-	for _, path := range pathsToCompact {
-		if err := os.Remove(path); err != nil {
-			log.Printf("ERROR: Failed to remove old SSTable %s after compaction: %v", path, err)
+	//delete old sstable files asynchronously
+	go func(pathsToDelete []string) {
+		for _, path := range pathsToDelete {
+			if err := os.Remove(path); err != nil {
+				log.Printf("ERROR: Failed to remove old SSTable %s after compaction: %v", path, err)
+			}
 		}
-	}
+		log.Printf("Successfully garbage collected %d old SSTables.", len(pathsToDelete))
+	}(pathsToCompact)
 }
