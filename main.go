@@ -16,11 +16,14 @@ func main() {
 	if err != nil {
 		log.Fatal("Failed to create DB: %v", err)
 	}
-	if err := db.Put([]byte("hello"), []byte("world")); err != nil {
-		log.Fatalf("Failed to put data: %v", err)
-	}
-	if err := db.Put([]byte("status"), []byte("ok")); err != nil {
-		log.Fatalf("Failed to put data: %v", err)
+	log.Println("Writing data to trigger a flush...")
+	for i := 0; i < 1000; i++ {
+		key := []byte(fmt.Sprintf("key-%03d", i))
+		value := []byte(fmt.Sprintf("value-%03d", i))
+
+		if err := db.Put(key, value); err != nil {
+			log.Fatalf("Failed to put key %s: %v", key, err)
+		}
 	}
 
 	val, ok := db.Get([]byte("hello"))

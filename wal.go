@@ -47,7 +47,7 @@ func NewWal(path string) (*WAL, error) {
 func (w *WAL) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.Close()
+	return w.file.Close()
 }
 
 // LogEntry format: crc(4 bytes) - length (2 bytes) - type(1 byte) - data(power of 1 byte)
@@ -97,7 +97,7 @@ func (w *WAL) Write(entry *LogEntry) error {
 // the in-memory state by replaying the operations
 func Replay(path string) (map[string][]byte, error) {
 	//open the file for reading only
-	flag := os.O_WRONLY
+	flag := os.O_RDONLY
 	mode := os.FileMode(0644)
 	file, err := os.OpenFile(path, flag, mode)
 	if err != nil {
