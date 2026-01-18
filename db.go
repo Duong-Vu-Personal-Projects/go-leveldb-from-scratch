@@ -1,4 +1,4 @@
-package go_leveldb_from_scratch_own
+package main
 
 import "log"
 
